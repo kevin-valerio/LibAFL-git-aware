@@ -29,6 +29,7 @@ default = [
   "cmplog-instructions",
   "ctx",
   "dump-cfg",
+  "git-recency",
 ]
 
 # llvm passes
@@ -39,6 +40,7 @@ coverage-accounting = []
 cmplog-instructions = []
 ctx = []
 dump-cfg = []
+git-recency = []
 
 [build-dependencies]
 cc = { workspace = true, features = ["parallel"] }

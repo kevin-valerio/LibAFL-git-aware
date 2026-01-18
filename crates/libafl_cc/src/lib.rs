@@ -51,6 +51,7 @@ pub mod cfg;
 pub use cfg::{CfgEdge, ControlFlowGraph, EntryBasicBlockInfo, HasWeight};
 pub mod clang;
 pub use clang::{ClangWrapper, LLVMPasses};
+mod git_recency;
 pub mod libtool;
 pub use libtool::LibtoolWrapper;
 
