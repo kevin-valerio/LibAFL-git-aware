@@ -78,7 +78,8 @@ static const Function *called_function_stripped(const CallBase *CB) {
   return dyn_cast<Function>(V);
 }
 
-static DebugLoc find_first_non_instrumentation_debugloc(const BasicBlock &BB) {
+static DebugLoc find_last_non_instrumentation_debugloc(const BasicBlock &BB) {
+  DebugLoc last;
   for (const auto &I : BB) {
     if (isa<DbgInfoIntrinsic>(&I)) { continue; }
 
@@ -101,11 +102,13 @@ static DebugLoc find_first_non_instrumentation_debugloc(const BasicBlock &BB) {
       }
     }
 
+    if (I.isTerminator()) { continue; }
+
     DebugLoc DL = I.getDebugLoc();
-    if (DL) { return DL; }
+    if (DL) { last = DL; }
   }
 
-  return DebugLoc();
+  return last;
 }
 
 class GitRecencyPass : public PassInfoMixin<GitRecencyPass> {
@@ -120,7 +123,7 @@ class GitRecencyPass : public PassInfoMixin<GitRecencyPass> {
     for (auto &F : M) {
       if (isIgnoreFunction(&F)) { continue; }
       for (auto &BB : F) {
-        DebugLoc DL = find_first_non_instrumentation_debugloc(BB);
+        DebugLoc DL = find_last_non_instrumentation_debugloc(BB);
 
         LocEntry E;
         if (DL) {

@@ -99,7 +99,9 @@ EOF
   } > parser.c
 
   git add fuzz.c parser.c
-  git commit -qm "bench: baseline (no bug)"
+  GIT_AUTHOR_DATE="2000-01-01T00:00:00Z" \
+    GIT_COMMITTER_DATE="2000-01-01T00:00:00Z" \
+    git commit -qm "bench: baseline (no bug)"
 
   python3 - <<'PY'
 from pathlib import Path
