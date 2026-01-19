@@ -8,11 +8,15 @@ use std::{
 };
 
 use crate::Error;
+use object::{Object, ObjectSection};
 
 pub(crate) const GIT_RECENCY_MAPPING_ENV: &str = "LIBAFL_GIT_RECENCY_MAPPING_PATH";
 
 const SIDECAR_MAGIC: &[u8; 8] = b"LAFLGIT1";
 pub(crate) const SIDECAR_EXT: &str = "libafl_git_recency";
+
+const GITREC_SECTION_NAMES: &[&str] = &["libafl_gitrec", "__libafl_gitrec"];
+const SANCOV_GUARDS_SECTION_NAMES: &[&str] = &["__sancov_guards", ".sancov_guards"];
 
 #[derive(Debug, Clone)]
 struct SidecarEntry {
@@ -40,62 +44,7 @@ fn write_u64_le(out: &mut impl Write, v: u64) -> Result<(), Error> {
 }
 
 fn parse_sidecar(bytes: &[u8]) -> Result<Vec<SidecarEntry>, Error> {
-    if bytes.len() < 16 {
-        return Err(Error::Unknown(
-            "git recency sidecar too small to be valid".to_string(),
-        ));
-    }
-    if &bytes[0..8] != SIDECAR_MAGIC {
-        return Err(Error::Unknown(
-            "git recency sidecar magic mismatch".to_string(),
-        ));
-    }
-
-    let len = read_u64_le(&bytes[8..16]);
-    let len = usize::try_from(len)
-        .map_err(|_| Error::Unknown("git recency sidecar length does not fit usize".to_string()))?;
-
-    let mut entries = Vec::with_capacity(len);
-    let mut offset = 16usize;
-    for _ in 0..len {
-        if offset + 8 > bytes.len() {
-            return Err(Error::Unknown(
-                "git recency sidecar truncated while reading entry header".to_string(),
-            ));
-        }
-        let line = read_u32_le(&bytes[offset..offset + 4]);
-        let path_len = read_u32_le(&bytes[offset + 4..offset + 8]) as usize;
-        offset += 8;
-
-        if offset + path_len > bytes.len() {
-            return Err(Error::Unknown(
-                "git recency sidecar truncated while reading path".to_string(),
-            ));
-        }
-
-        let file = if line == 0 || path_len == 0 {
-            None
-        } else {
-            let path_bytes = &bytes[offset..offset + path_len];
-            offset += path_len;
-            Some(String::from_utf8(path_bytes.to_vec()).map_err(|e| {
-                Error::Unknown(format!("git recency sidecar contains non-utf8 path: {e}"))
-            })?)
-        };
-        if file.is_none() {
-            // If unknown, ignore any path bytes already accounted for.
-            offset += path_len;
-        }
-
-        entries.push(SidecarEntry { file, line });
-    }
-
-    if offset != bytes.len() {
-        return Err(Error::Unknown(
-            "git recency sidecar has trailing bytes".to_string(),
-        ));
-    }
-
+    let entries = parse_sidecar_stream(bytes)?;
     Ok(entries)
 }
 
@@ -227,55 +176,182 @@ fn blame_times_for_lines(
     Ok(res)
 }
 
+fn read_gitrec_and_guard_counts(
+    link_output: &Path,
+) -> Result<(Option<Vec<u8>>, usize), Error> {
+    let bytes = fs::read(link_output).map_err(Error::Io)?;
+    let obj = object::File::parse(&*bytes).map_err(|e| {
+        Error::Unknown(format!(
+            "failed to parse linked output as object file '{}': {e}",
+            link_output.display()
+        ))
+    })?;
+
+    let mut guard_bytes_total: u64 = 0;
+    let mut gitrec_bytes: Vec<u8> = Vec::new();
+    let mut saw_gitrec = false;
+
+    for section in obj.sections() {
+        let Ok(name) = section.name() else {
+            continue;
+        };
+
+        if GITREC_SECTION_NAMES.iter().any(|n| *n == name) {
+            let data = section.uncompressed_data().map_err(|e| {
+                Error::Unknown(format!(
+                    "failed to read section '{name}' from '{}': {e}",
+                    link_output.display()
+                ))
+            })?;
+            gitrec_bytes.extend_from_slice(&data);
+            saw_gitrec = true;
+        }
+
+        if SANCOV_GUARDS_SECTION_NAMES.iter().any(|n| *n == name) {
+            guard_bytes_total = guard_bytes_total.saturating_add(section.size());
+        }
+    }
+
+    let guard_bytes_total = usize::try_from(guard_bytes_total).map_err(|_| {
+        Error::Unknown("coverage guard section size does not fit usize".to_string())
+    })?;
+    if guard_bytes_total % 4 != 0 {
+        return Err(Error::Unknown(format!(
+            "coverage guard section size ({guard_bytes_total}) is not a multiple of 4"
+        )));
+    }
+    let guard_count = guard_bytes_total / 4;
+
+    Ok((saw_gitrec.then_some(gitrec_bytes), guard_count))
+}
+
+fn parse_sidecar_stream(bytes: &[u8]) -> Result<Vec<SidecarEntry>, Error> {
+    let mut entries: Vec<SidecarEntry> = Vec::new();
+    let mut offset = 0usize;
+
+    while offset < bytes.len() {
+        if offset + 16 > bytes.len() {
+            return Err(Error::Unknown(
+                "git recency sidecar truncated while reading header".to_string(),
+            ));
+        }
+        if &bytes[offset..offset + 8] != SIDECAR_MAGIC {
+            return Err(Error::Unknown(
+                "git recency sidecar magic mismatch".to_string(),
+            ));
+        }
+
+        let len = read_u64_le(&bytes[offset + 8..offset + 16]);
+        let len = usize::try_from(len).map_err(|_| {
+            Error::Unknown("git recency sidecar length does not fit usize".to_string())
+        })?;
+        offset += 16;
+
+        for _ in 0..len {
+            if offset + 8 > bytes.len() {
+                return Err(Error::Unknown(
+                    "git recency sidecar truncated while reading entry header".to_string(),
+                ));
+            }
+            let line = read_u32_le(&bytes[offset..offset + 4]);
+            let path_len = read_u32_le(&bytes[offset + 4..offset + 8]) as usize;
+            offset += 8;
+
+            if offset + path_len > bytes.len() {
+                return Err(Error::Unknown(
+                    "git recency sidecar truncated while reading path".to_string(),
+                ));
+            }
+
+            let file = if line == 0 || path_len == 0 {
+                None
+            } else {
+                let path_bytes = &bytes[offset..offset + path_len];
+                Some(String::from_utf8(path_bytes.to_vec()).map_err(|e| {
+                    Error::Unknown(format!("git recency sidecar contains non-utf8 path: {e}"))
+                })?)
+            };
+            offset += path_len;
+
+            entries.push(SidecarEntry { file, line });
+        }
+    }
+
+    Ok(entries)
+}
+
 pub(crate) fn generate_git_recency_mapping(
     mapping_out: &Path,
+    link_output: &Path,
     object_files: &[PathBuf],
     cwd: &Path,
 ) -> Result<(), Error> {
+    let link_output = if link_output.is_absolute() {
+        link_output.to_path_buf()
+    } else {
+        cwd.join(link_output)
+    };
+
     let repo_root = repo_root(cwd)?;
     let repo_root = fs::canonicalize(&repo_root).map_err(Error::Io)?;
 
     let head_time = head_time_epoch_seconds(&repo_root)?;
 
-    let mut resolved: Vec<Option<(String, u32)>> = Vec::new();
-    for obj in object_files {
-        let sidecar_path = sidecar_path_for_object(obj);
-        let sidecar_bytes = fs::read(&sidecar_path).map_err(|e| {
-            Error::Unknown(format!(
-                "missing git recency sidecar for object {}: {e}",
-                obj.display()
-            ))
-        })?;
+    let (embedded_bytes, guard_count) = read_gitrec_and_guard_counts(&link_output)?;
 
-        let sidecar_entries = parse_sidecar(&sidecar_bytes)?;
-        for entry in sidecar_entries {
-            let Some(file) = entry.file else {
-                resolved.push(None);
-                continue;
-            };
-
-            if entry.line == 0 {
-                resolved.push(None);
-                continue;
-            }
-
-            let p = PathBuf::from(file);
-            let p = if p.is_absolute() { p } else { cwd.join(p) };
-
-            let Ok(p) = fs::canonicalize(&p) else {
-                resolved.push(None);
-                continue;
-            };
-
-            if !p.starts_with(&repo_root) {
-                resolved.push(None);
-                continue;
-            }
-
-            let rel = p.strip_prefix(&repo_root).unwrap();
-            let rel = rel.to_string_lossy().replace('\\', "/");
-            resolved.push(Some((rel, entry.line)));
+    let entries = if let Some(bytes) = embedded_bytes {
+        parse_sidecar_stream(&bytes)?
+    } else {
+        let mut entries: Vec<SidecarEntry> = Vec::new();
+        for obj in object_files {
+            let sidecar_path = sidecar_path_for_object(obj);
+            let sidecar_bytes = fs::read(&sidecar_path).map_err(|e| {
+                Error::Unknown(format!(
+                    "missing git recency sidecar for object {}: {e}",
+                    obj.display()
+                ))
+            })?;
+            entries.extend(parse_sidecar(&sidecar_bytes)?);
         }
+        entries
+    };
+
+    if entries.len() != guard_count {
+        return Err(Error::Unknown(format!(
+            "git recency mapping entry count ({}) does not match guard count ({guard_count}) in '{}'",
+            entries.len(),
+            link_output.display()
+        )));
+    }
+
+    let mut resolved: Vec<Option<(String, u32)>> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Some(file) = entry.file else {
+            resolved.push(None);
+            continue;
+        };
+
+        if entry.line == 0 {
+            resolved.push(None);
+            continue;
+        }
+
+        let p = PathBuf::from(file);
+        let p = if p.is_absolute() { p } else { cwd.join(p) };
+
+        let Ok(p) = fs::canonicalize(&p) else {
+            resolved.push(None);
+            continue;
+        };
+
+        if !p.starts_with(&repo_root) {
+            resolved.push(None);
+            continue;
+        }
+
+        let rel = p.strip_prefix(&repo_root).unwrap();
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        resolved.push(Some((rel, entry.line)));
     }
 
     let mut needed_by_file: HashMap<String, HashSet<u32>> = HashMap::new();
@@ -321,7 +397,7 @@ pub(crate) fn generate_git_recency_mapping(
 
 #[cfg(test)]
 mod tests {
-    use super::{SIDECAR_MAGIC, parse_sidecar};
+    use super::{SIDECAR_MAGIC, parse_sidecar, parse_sidecar_stream};
 
     #[test]
     fn test_parse_sidecar_empty() {
@@ -330,5 +406,40 @@ mod tests {
         bytes.extend_from_slice(&0u64.to_le_bytes());
         let entries = parse_sidecar(&bytes).unwrap();
         assert!(entries.is_empty());
+    }
+
+    fn build_sidecar_blob(entries: &[(u32, Option<&str>)]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(SIDECAR_MAGIC);
+        bytes.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+        for (line, path) in entries {
+            bytes.extend_from_slice(&line.to_le_bytes());
+            if let Some(path) = path {
+                bytes.extend_from_slice(&(path.len() as u32).to_le_bytes());
+                bytes.extend_from_slice(path.as_bytes());
+            } else {
+                bytes.extend_from_slice(&0u32.to_le_bytes());
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn test_parse_sidecar_stream_concat() {
+        let blob1 = build_sidecar_blob(&[(12, Some("a.c")), (0, None)]);
+        let blob2 = build_sidecar_blob(&[(7, Some("b.c"))]);
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&blob1);
+        bytes.extend_from_slice(&blob2);
+
+        let entries = parse_sidecar_stream(&bytes).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].line, 12);
+        assert_eq!(entries[0].file.as_deref(), Some("a.c"));
+        assert_eq!(entries[1].line, 0);
+        assert_eq!(entries[1].file.as_deref(), None);
+        assert_eq!(entries[2].line, 7);
+        assert_eq!(entries[2].file.as_deref(), Some("b.c"));
     }
 }

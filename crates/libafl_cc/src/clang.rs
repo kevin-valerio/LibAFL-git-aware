@@ -432,6 +432,11 @@ impl ToolWrapper for ClangWrapper {
                 .is_some_and(|p| p.ends_with(".o") || p.ends_with(".obj"))
         {
             use_pass = true;
+            // Ensure sanitizer/coverage instrumentation runs early enough so the
+            // git-recency pass can observe the final pc-guard sites.
+            args.push("-mllvm".into());
+            args.push("--sanitizer-early-opt-ep".into());
+
             let pass_path = LLVMPasses::GitRecency
                 .path()
                 .into_os_string()
@@ -560,27 +565,26 @@ impl ToolWrapper for ClangWrapper {
                 && self.linking
                 && let Some(mapping_out) = &self.git_recency_mapping_out
             {
+                let mut link_output: Option<PathBuf> = None;
+                let mut i = 1;
+                while i + 1 < args.len() {
+                    if args[i] == "-o" {
+                        link_output = Some(PathBuf::from(&args[i + 1]));
+                    }
+                    i += 1;
+                }
+                let Some(link_output) = link_output else {
+                    return Err(Error::Unknown(
+                        "git recency mapping could not determine link output path".to_string(),
+                    ));
+                };
+
                 let mut object_files: Vec<PathBuf> = Vec::new();
                 for arg in &args[1..] {
                     if arg.starts_with('-') || arg.starts_with('@') {
                         continue;
                     }
                     if arg.ends_with(".a") {
-                        // v1 doesn't support static archives that contain instrumented objects
-                        // (guard ordering depends on which members get pulled in).
-                        // However, our own wrappers often link Rust staticlibs (like the fuzzer
-                        // harness) which do not contain `-fsanitize-coverage=trace-pc-guard`
-                        // guards. Allow those.
-                        let bytes = std::fs::read(arg).map_err(Error::Io)?;
-                        if bytes
-                            .windows(b"__sancov_guards".len())
-                            .any(|w| w == b"__sancov_guards")
-                        {
-                            return Err(Error::Unknown(
-                                "git recency mapping v1 does not support instrumented .a archives on the link line"
-                                    .to_string(),
-                            ));
-                        }
                         continue;
                     }
                     if arg.ends_with(".o") || arg.ends_with(".obj") {
@@ -588,7 +592,12 @@ impl ToolWrapper for ClangWrapper {
                     }
                 }
 
-                crate::git_recency::generate_git_recency_mapping(mapping_out, &object_files, &cwd)?;
+                crate::git_recency::generate_git_recency_mapping(
+                    mapping_out,
+                    &link_output,
+                    &object_files,
+                    &cwd,
+                )?;
             }
         }
 

@@ -6,7 +6,8 @@
    to source locations (file + line). The final mapping to `git blame` timestamps
    is produced at link time by `libafl_cc`.
 
-   v1 scope: only direct `.o` inputs are supported when merging at link time.
+   The mapping is emitted both as a sidecar file (v1) and embedded into the object
+   in a dedicated section (v2) so link-time merging can handle static archives.
 */
 
 #include "common-llvm.h"
@@ -14,6 +15,8 @@
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/Support/Alignment.h"
+#include "llvm/Transforms/Utils/ModuleUtils.h"
 
 #include <algorithm>
 #include <fstream>
@@ -59,6 +62,24 @@ static void write_u64_le(std::ofstream &out, uint64_t v) {
   b[6] = (uint8_t)((v >> 48) & 0xff);
   b[7] = (uint8_t)((v >> 56) & 0xff);
   out.write(reinterpret_cast<const char *>(b), sizeof(b));
+}
+
+static void append_u32_le(std::vector<uint8_t> &out, uint32_t v) {
+  out.push_back((uint8_t)(v & 0xff));
+  out.push_back((uint8_t)((v >> 8) & 0xff));
+  out.push_back((uint8_t)((v >> 16) & 0xff));
+  out.push_back((uint8_t)((v >> 24) & 0xff));
+}
+
+static void append_u64_le(std::vector<uint8_t> &out, uint64_t v) {
+  out.push_back((uint8_t)(v & 0xff));
+  out.push_back((uint8_t)((v >> 8) & 0xff));
+  out.push_back((uint8_t)((v >> 16) & 0xff));
+  out.push_back((uint8_t)((v >> 24) & 0xff));
+  out.push_back((uint8_t)((v >> 32) & 0xff));
+  out.push_back((uint8_t)((v >> 40) & 0xff));
+  out.push_back((uint8_t)((v >> 48) & 0xff));
+  out.push_back((uint8_t)((v >> 56) & 0xff));
 }
 
 static bool is_sancov_trace_function(StringRef name) {
@@ -115,14 +136,27 @@ class GitRecencyPass : public PassInfoMixin<GitRecencyPass> {
  public:
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
     if (SidecarPath.empty()) { return PreservedAnalyses::all(); }
-    // Collect source locations for each instrumented basic block.
-    // This pass runs before `sancov-module` is added to the pipeline by clang.
-    // The guard array order is the order in which blocks get instrumented, which
-    // matches the module's function/basic-block iteration order.
+    // Collect source locations for each *instrumented* basic block.
+    //
+    // We only record blocks that contain a trace-pc-guard hook call. This keeps
+    // the emitted entry count aligned with the number of guards in the object.
     std::vector<LocEntry> ordered;
     for (auto &F : M) {
       if (isIgnoreFunction(&F)) { continue; }
       for (auto &BB : F) {
+        bool has_trace_pc_guard = false;
+        for (auto const &I : BB) {
+          auto *CB = dyn_cast<CallBase>(&I);
+          if (!CB) { continue; }
+          if (auto *Callee = called_function_stripped(CB)) {
+            if (is_sancov_trace_function(Callee->getName())) {
+              has_trace_pc_guard = true;
+              break;
+            }
+          }
+        }
+        if (!has_trace_pc_guard) { continue; }
+
         DebugLoc DL = find_last_non_instrumentation_debugloc(BB);
 
         LocEntry E;
@@ -147,28 +181,49 @@ class GitRecencyPass : public PassInfoMixin<GitRecencyPass> {
       }
     }
 
+    std::vector<uint8_t> blob;
+    blob.insert(blob.end(), kMagic, kMagic + sizeof(kMagic));
+    append_u64_le(blob, static_cast<uint64_t>(ordered.size()));
+
+    for (auto const &E : ordered) {
+      if (!E.known) {
+        append_u32_le(blob, 0);
+        append_u32_le(blob, 0);
+        continue;
+      }
+
+      append_u32_le(blob, E.line);
+      append_u32_le(blob, static_cast<uint32_t>(E.path.size()));
+      blob.insert(blob.end(), E.path.begin(), E.path.end());
+    }
+
+    // v1: sidecar file
     std::ofstream out(SidecarPath, std::ios::binary | std::ios::out);
     if (!out.is_open()) {
       FATAL("Could not open git recency sidecar for writing: %s\n",
             SidecarPath.c_str());
     }
-
-    out.write(kMagic, sizeof(kMagic));
-    write_u64_le(out, static_cast<uint64_t>(ordered.size()));
-
-    for (auto const &E : ordered) {
-      if (!E.known) {
-        write_u32_le(out, 0);
-        write_u32_le(out, 0);
-        continue;
-      }
-
-      write_u32_le(out, E.line);
-      write_u32_le(out, static_cast<uint32_t>(E.path.size()));
-      out.write(E.path.data(), static_cast<std::streamsize>(E.path.size()));
-    }
-
+    out.write(reinterpret_cast<const char *>(blob.data()),
+              static_cast<std::streamsize>(blob.size()));
     out.close();
+
+    // v2: embedded section (supports static archives at link time)
+    auto &Ctx = M.getContext();
+    ArrayType *arrayTy = ArrayType::get(IntegerType::get(Ctx, 8), blob.size());
+    GlobalVariable *meta = new GlobalVariable(
+        M, arrayTy, true, GlobalVariable::PrivateLinkage,
+        ConstantDataArray::get(Ctx, ArrayRef<uint8_t>(blob.data(), blob.size())),
+        "libafl_gitrecency_" + M.getName());
+    meta->setAlignment(Align(1));
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || \
+    defined(__OpenBSD__) || defined(__DragonFly__)
+    meta->setSection("libafl_gitrec");
+#elif defined(__APPLE__)
+    meta->setSection("__DATA,__libafl_gitrec");
+#endif
+    GlobalValue *used[] = {meta};
+    appendToCompilerUsed(M, used);
+
     return PreservedAnalyses::all();
   }
 };
