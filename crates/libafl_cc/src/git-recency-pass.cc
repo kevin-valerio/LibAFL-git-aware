@@ -78,105 +78,6 @@ static const Function *called_function_stripped(const CallBase *CB) {
   return dyn_cast<Function>(V);
 }
 
-static bool resolve_guard_ptr(Value *V, const DataLayout &DL,
-                              const GlobalVariable *&out_gv, uint64_t &out_idx) {
-  if (!V) { return false; }
-
-  Value *stripped = V->stripPointerCasts();
-
-  if (auto *GEP = dyn_cast<GEPOperator>(stripped)) {
-    Value *base = GEP->getPointerOperand()->stripPointerCasts();
-    auto  *GV = dyn_cast<GlobalVariable>(base);
-    if (!GV) { return false; }
-
-    uint64_t idx = 0;
-    for (auto I = GEP->idx_begin(); I != GEP->idx_end(); ++I) {
-      auto *CI = dyn_cast<ConstantInt>(I->get());
-      if (!CI) { return false; }
-      idx = CI->getZExtValue();
-    }
-
-    out_gv = GV;
-    out_idx = idx;
-    return true;
-  }
-
-  if (auto *GV = dyn_cast<GlobalVariable>(stripped)) {
-    out_gv = GV;
-    out_idx = 0;
-    return true;
-  }
-
-  // Clang 18+ with opaque pointers may lower guard element pointers as:
-  //   inttoptr (add (ptrtoint @GV, const))  instead of a GEP.
-  //
-  // Decode: inttoptr(add(ptrtoint(GV), offset_bytes)) -> (GV, offset_bytes /
-  // elem_size).
-  if (auto *CE = dyn_cast<ConstantExpr>(stripped)) {
-    if (CE->getOpcode() == Instruction::IntToPtr) {
-      Value *inner = CE->getOperand(0);
-      const GlobalVariable *GV = nullptr;
-      uint64_t offset_bytes = 0;
-
-      auto decode_ptrtoint_gv = [&](Value *X, const GlobalVariable *&Out) {
-        if (auto *P2I = dyn_cast<ConstantExpr>(X)) {
-          if (P2I->getOpcode() != Instruction::PtrToInt) { return false; }
-          Value *P = P2I->getOperand(0)->stripPointerCasts();
-          Out = dyn_cast<GlobalVariable>(P);
-          return Out != nullptr;
-        }
-        return false;
-      };
-
-      if (auto *Add = dyn_cast<ConstantExpr>(inner)) {
-        if (Add->getOpcode() == Instruction::Add) {
-          Value *Op0 = Add->getOperand(0);
-          Value *Op1 = Add->getOperand(1);
-
-          const GlobalVariable *BaseGV = nullptr;
-          const ConstantInt    *Cst = nullptr;
-
-          if (auto *CI = dyn_cast<ConstantInt>(Op0)) {
-            Cst = CI;
-            if (!decode_ptrtoint_gv(Op1, BaseGV)) { return false; }
-          } else if (auto *CI = dyn_cast<ConstantInt>(Op1)) {
-            Cst = CI;
-            if (!decode_ptrtoint_gv(Op0, BaseGV)) { return false; }
-          } else {
-            return false;
-          }
-
-          GV = BaseGV;
-          offset_bytes = Cst->getZExtValue();
-        } else if (Add->getOpcode() == Instruction::PtrToInt) {
-          if (!decode_ptrtoint_gv(Add, GV)) { return false; }
-          offset_bytes = 0;
-        }
-      } else if (auto *P2I = dyn_cast<ConstantExpr>(inner)) {
-        if (P2I->getOpcode() == Instruction::PtrToInt) {
-          if (!decode_ptrtoint_gv(P2I, GV)) { return false; }
-          offset_bytes = 0;
-        }
-      }
-
-      if (!GV) { return false; }
-
-      Type *VT = GV->getValueType();
-      Type *ElemT = VT;
-      if (auto *AT = dyn_cast<ArrayType>(VT)) { ElemT = AT->getElementType(); }
-
-      uint64_t elem_size = DL.getTypeAllocSize(ElemT);
-      if (elem_size == 0 || (offset_bytes % elem_size) != 0) { return false; }
-
-      out_gv = GV;
-      out_idx = offset_bytes / elem_size;
-      return true;
-    }
-  }
-
-  return false;
-}
-
 static DebugLoc find_first_non_instrumentation_debugloc(const BasicBlock &BB) {
   for (const auto &I : BB) {
     if (isa<DbgInfoIntrinsic>(&I)) { continue; }
@@ -207,59 +108,21 @@ static DebugLoc find_first_non_instrumentation_debugloc(const BasicBlock &BB) {
   return DebugLoc();
 }
 
-static uint64_t guard_global_len(const GlobalVariable *GV) {
-  if (!GV) { return 0; }
-  Type *VT = GV->getValueType();
-  if (auto *AT = dyn_cast<ArrayType>(VT)) { return AT->getNumElements(); }
-  return 1;
-}
-
 class GitRecencyPass : public PassInfoMixin<GitRecencyPass> {
  public:
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
     if (SidecarPath.empty()) { return PreservedAnalyses::all(); }
-    const DataLayout &DLay = M.getDataLayout();
-
-    std::unordered_map<const GlobalVariable *, std::vector<LocEntry>> entries;
-    std::vector<const GlobalVariable *>                             guard_order;
-
-    // Prefer the runtime init call order (matches the order in which this
-    // module's guards get indices assigned).
-    for (auto &F : M) {
-      for (auto &BB : F) {
-        for (auto &I : BB) {
-          auto *CB = dyn_cast<CallBase>(&I);
-          if (!CB) { continue; }
-          auto *Callee = called_function_stripped(CB);
-          if (!Callee) { continue; }
-          if (!is_sancov_init_function(Callee->getName())) { continue; }
-          if (CB->arg_size() < 2) { continue; }
-
-          const GlobalVariable *GV = nullptr;
-          uint64_t              idx = 0;
-          if (!resolve_guard_ptr(CB->getArgOperand(0), DLay, GV, idx)) { continue; }
-
-          if (std::find(guard_order.begin(), guard_order.end(), GV) ==
-              guard_order.end()) {
-            guard_order.push_back(GV);
-          }
-
-          if (entries.find(GV) == entries.end()) {
-            uint64_t len = guard_global_len(GV);
-            entries.emplace(GV, std::vector<LocEntry>(static_cast<size_t>(len)));
-          }
-        }
-      }
-    }
-
-    // Collect source locations for each trace site.
+    // Collect source locations for each instrumented basic block.
+    // This pass runs before `sancov-module` is added to the pipeline by clang.
+    // The guard array order is the order in which blocks get instrumented, which
+    // matches the module's function/basic-block iteration order.
+    std::vector<LocEntry> ordered;
     for (auto &F : M) {
       if (isIgnoreFunction(&F)) { continue; }
       for (auto &BB : F) {
         DebugLoc DL = find_first_non_instrumentation_debugloc(BB);
 
-        std::string file_path;
-        uint32_t    line = 0;
+        LocEntry E;
         if (DL) {
           const auto *Loc = DL.get();
           if (Loc) {
@@ -267,62 +130,18 @@ class GitRecencyPass : public PassInfoMixin<GitRecencyPass> {
               std::string dir = File->getDirectory().str();
               std::string fname = File->getFilename().str();
               if (!dir.empty()) {
-                file_path = dir + "/" + fname;
+                E.path = dir + "/" + fname;
               } else {
-                file_path = fname;
+                E.path = fname;
               }
-              line = Loc->getLine();
+              E.line = Loc->getLine();
+              E.known = (!E.path.empty() && E.line != 0);
             }
           }
         }
 
-        for (auto &I : BB) {
-          auto *CB = dyn_cast<CallBase>(&I);
-          if (!CB) { continue; }
-          auto *Callee = called_function_stripped(CB);
-          if (!Callee) { continue; }
-
-          if (!is_sancov_trace_function(Callee->getName())) { continue; }
-          if (CB->arg_size() < 1) { continue; }
-
-          const GlobalVariable *GV = nullptr;
-          uint64_t              guard_idx = 0;
-          if (!resolve_guard_ptr(CB->getArgOperand(0), DLay, GV, guard_idx)) {
-            continue;
-          }
-
-          if (entries.find(GV) == entries.end()) {
-            uint64_t len = guard_global_len(GV);
-            entries.emplace(GV, std::vector<LocEntry>(static_cast<size_t>(len)));
-          }
-          auto &vec = entries[GV];
-          if (guard_idx >= vec.size()) { continue; }
-
-          auto &E = vec[static_cast<size_t>(guard_idx)];
-          if (!file_path.empty() && line != 0) {
-            E.path = file_path;
-            E.line = line;
-            E.known = true;
-          }
-        }
+        ordered.push_back(std::move(E));
       }
-    }
-
-    if (guard_order.empty()) {
-      guard_order.reserve(entries.size());
-      for (auto const &KV : entries) {
-        guard_order.push_back(KV.first);
-      }
-      std::sort(guard_order.begin(), guard_order.end(),
-                [](const GlobalVariable *A, const GlobalVariable *B) {
-                  return A->getName() < B->getName();
-                });
-    }
-
-    uint64_t total_len = 0;
-    for (auto *GV : guard_order) {
-      auto it = entries.find(GV);
-      if (it != entries.end()) { total_len += it->second.size(); }
     }
 
     std::ofstream out(SidecarPath, std::ios::binary | std::ios::out);
@@ -332,23 +151,18 @@ class GitRecencyPass : public PassInfoMixin<GitRecencyPass> {
     }
 
     out.write(kMagic, sizeof(kMagic));
-    write_u64_le(out, total_len);
+    write_u64_le(out, static_cast<uint64_t>(ordered.size()));
 
-    for (auto *GV : guard_order) {
-      auto it = entries.find(GV);
-      if (it == entries.end()) { continue; }
-
-      for (auto const &E : it->second) {
-        if (!E.known) {
-          write_u32_le(out, 0);
-          write_u32_le(out, 0);
-          continue;
-        }
-
-        write_u32_le(out, E.line);
-        write_u32_le(out, static_cast<uint32_t>(E.path.size()));
-        out.write(E.path.data(), static_cast<std::streamsize>(E.path.size()));
+    for (auto const &E : ordered) {
+      if (!E.known) {
+        write_u32_le(out, 0);
+        write_u32_le(out, 0);
+        continue;
       }
+
+      write_u32_le(out, E.line);
+      write_u32_le(out, static_cast<uint32_t>(E.path.size()));
+      out.write(E.path.data(), static_cast<std::streamsize>(E.path.size()));
     }
 
     out.close();
