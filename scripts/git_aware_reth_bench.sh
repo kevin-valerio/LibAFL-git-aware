@@ -382,7 +382,7 @@ fn fuzz(out_dir: PathBuf, seed_dir: &PathBuf, timeout: Duration) -> Result<(), E
         };
 
     let edges_observer = unsafe { std_edges_map_observer("edges") };
-    let mut edges_observer = HitcountsMapObserver::new(edges_observer).track_indices();
+    let edges_observer = HitcountsMapObserver::new(edges_observer).track_indices();
     let time_observer = TimeObserver::new("time");
 
     let mut feedback = MaxMapFeedback::new(&edges_observer);

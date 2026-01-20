@@ -1,4 +1,4 @@
-# LibAFL-history-aware
+# LibAFL-git-aware
 
 This is a fork of [`AFLplusplus/LibAFL`](https://github.com/AFLplusplus/LibAFL).
 
