@@ -1,19 +1,16 @@
 # LibAFL-git-aware
 
-This is a fork of [`AFLplusplus/LibAFL`](https://github.com/AFLplusplus/LibAFL).
-
-The main goal is simple: keep coverage-guided fuzzing, but also prefer testcases that run code changed recently (based on `git blame`).
+This is a fork of [`AFLplusplus/LibAFL`](https://github.com/AFLplusplus/LibAFL). The objective is simple: keep coverage-guided fuzzing, but also prefer testcases that run code changed or added recently (based on `git blame`).
 
 ## What this adds
 
-It adds an opt-in scheduler score that boosts testcases which cover recently changed lines.
-“Recent” means the last commit time from `git blame` (`%ct`, epoch seconds).
+It adds an opt-in scheduler score that boosts testcases which cover recently changed lines. "Recent" means the last commit time from `git blame`.
 
 ## When to use
 
 This is most useful when your target is under active development and you want to find regressions in recently changed code faster (for example: fuzzing a PR, a release branch, or after a refactor).
 
-Another good workflow is for **large codebases with big seed corpora**: run your normal coverage-guided harness until the corpus is “stable” (diminishing returns), then switch on the git-aware scheduler and restart the fuzzer using the *same corpus*. That way, scheduling effort shifts toward inputs that hit *recently changed lines*, which is a nice fit for continuous audit / code review and helps avoid spending most cycles on code last touched years ago.
+Another good workflow is for **large codebases with big seed corpora**: run your normal coverage-guided harness until the corpus is “stable” (diminishing returns), then switch on the git-aware scheduler and restart the fuzzer using the *same corpus*. That way, scheduling effort shifts toward inputs that hit *recently changed/added lines*, which is a nice fit for continuous audit / code review and helps avoid spending most cycles on code last touched years ago.
 
 To enable it in an existing harness, the minimal additions look like:
 
@@ -29,23 +26,19 @@ let scheduler = GitAwareStdWeightedScheduler::new(&mut state, &edges_observer);
 Best practices:
 - Commit the changes you care about before building (recency comes from `git blame`).
 - Rebuild the target and regenerate the mapping whenever `HEAD` changes.
-- Keep `alpha` modest (start with the default `2.0`) and consider alternating baseline and git-aware runs if you also care about long-horizon exploration.
 - For continuous audit/code review, keep a long-running baseline fuzzer, and spin up a git-aware run on each new commit/PR (same harness + same corpus, new build + new mapping).
 
-Recommendation: enable the git-aware scheduler for “fresh change” fuzzing, and keep a baseline run in parallel for broad coverage.
 
 ## How it works
 
 At build time, `libafl_cc` creates a mapping from SanitizerCoverage `trace-pc-guard` map indexes to `git blame` timestamps.
 At runtime, the fuzzer loads that mapping and the scheduler uses it to bias corpus selection.
 
-The mapping file format is:
-
-`u64 head_time` + `u64 len` + `len * u64 entries` (all little-endian).
+The mapping file format is: `u64 head_time` + `u64 len` + `len * u64 entries` (all little-endian).
 
 ## Implementation details (how it is built)
 
-### Build step 1: record “index → source location” per object file
+### Build step 1: record “index -> source location” per object file
 
 When you compile with `libafl_cc` and you set `LIBAFL_GIT_RECENCY_MAPPING_PATH`, the wrapper loads an LLVM pass while compiling each object file.
 
@@ -93,7 +86,7 @@ The decay is exponential with a fixed half-life of 14 days:
 
 To keep runtime overhead low, `tc_time` is computed once per testcase and cached inside `GitRecencyTestcaseMetadata`.
 
-### “How do we know the runtime map index matches the .bin entry?”
+### How do we know the runtime map index matches the .bin entry?
 
 This only works because the mapping uses the same index that the target uses at runtime.
 
@@ -101,7 +94,7 @@ With SanitizerCoverage `trace-pc-guard`, each instrumented site has a “guard�
 At startup, `__sanitizer_cov_trace_pc_guard_init` assigns each guard a unique number (0, 1, 2, …).
 `libafl_targets` then uses that number directly as the index into the coverage map.
 
-So the “basic block ID” you see in `MapIndexesMetadata` is the same number that was written into the guard, and the mapping file stores `entries[that_number]`.
+So the "basic block ID" you see in `MapIndexesMetadata` is the same number that was written into the guard, and the mapping file stores `entries[that_number]`.
 
 The tricky part is ordering.
 The runtime assigns those numbers by walking each object’s guard array, and doing that for all objects.
@@ -113,10 +106,9 @@ Also, this expects plain pc-guard indexing. If you enable instrumentation modes 
 
 ## How to use it
 
-### 1) Build your target and generate the mapping
+### 1a) Build your target and generate the mapping (C/C++)
 
-Set `LIBAFL_GIT_RECENCY_MAPPING_PATH` to where you want the mapping file.
-Then build your target using a `libafl_cc` wrapper so the mapping can be created at the final link step.
+Build your target using a `libafl_cc` wrapper so the mapping can be created at the final link step. 
 
 Example:
 
@@ -128,23 +120,24 @@ export CC="$(pwd)/target/release/libafl_cc"
 export CXX="$(pwd)/target/release/libafl_cxx"
 export LIBAFL_GIT_RECENCY_MAPPING_PATH="$(pwd)/git_recency_map.bin"
 
-make CC="$CC" CXX="$CXX" -j"$(nproc)"
+make CC="$CC" CXX="$CXX""
 ```
 
 Notes: you must use `-fsanitize-coverage=trace-pc-guard` and have debug info (`-g`) so coverage sites can be mapped to `file:line`.
 Instrumented `.a` archives are supported for mapping generation, as long as they were built with the `libafl_cc` wrappers so the embedded metadata is available in the final linked output.
 
-### 1b) Rust in-process fuzzing (libFuzzer-style)
+### 1b) Build your target and generate the mapping for Rust in-process fuzzing 
 
-If your fuzz target is a Rust in-process fuzzer binary, you can instrument it with SanitizerCoverage `trace-pc-guard` plus the git-recency LLVM plugin, then generate the mapping from the resulting binary. This requires nightly (or `RUSTC_BOOTSTRAP=1`) because `-Zllvm-plugins` is unstable.
+If your fuzz target is a Rust in-process fuzzer binary, you can instrument it with SanitizerCoverage `trace-pc-guard` plus the git-recency LLVM plugin, then generate the mapping from the resulting binary. This requires nightly (or `RUSTC_BOOTSTRAP=1`) because `-Zllvm-plugins` is unstable. 
+
+You can use the following snippet. This basically compiles libafl_cc
 
 ```sh
-# Build the pass plugin + mapgen tool (in this repo)
+# Step 1: Build the pass plugin + mapgen tool (in this repo)
 LLVM_CONFIG=llvm-config-20 cargo build -p libafl_cc --release
 
-# Build your fuzzer binary (in the target repo you want to `git blame`)
-plugin="$(find /path/to/LibAFL-git-aware/target/release -name 'git-recency-pass.so' -type f | head -n 1)"
-
+# Step 2: Build your fuzzer binary (in the target repo you want to `git blame`)
+plugin="$(find /path/to/LibAFL-git-aware/target/release -name 'git-recency-pass.so' -type f | head -n 1)" # this is to easily localte git-recency-pass.so
 rustflags=(
   "-Cdebuginfo=1"
   "-Cpasses=sancov-module libafl-git-recency"
@@ -152,15 +145,10 @@ rustflags=(
   "-Cllvm-args=--sanitizer-coverage-trace-pc-guard"
   "-Zllvm-plugins=${plugin}"
 )
+CARGO_ENCODED_RUSTFLAGS="$(IFS=$'\x1f'; echo "${rustflags[*]}")" RUSTC_BOOTSTRAP=1 cargo build --release -p <your-fuzzer-crate> 
 
-CARGO_ENCODED_RUSTFLAGS="$(IFS=$'\x1f'; echo "${rustflags[*]}")" \
-RUSTC_BOOTSTRAP=1 \
-cargo build --release -p <your-fuzzer-crate>
-
-# Generate the mapping for the produced binary (run from the target repo root)
-/path/to/LibAFL-git-aware/target/release/libafl_git_recency_mapgen \
-  --out git_recency_map.bin \
-  --bin target/release/<your-fuzzer-binary>
+# Step 3: Generate the mapping for the produced binary (run from the target repo root)
+/path/to/LibAFL-git-aware/target/release/libafl_git_recency_mapgen --out git_recency_map.bin --bin target/release/<your-fuzzer-binary>
 ```
 
 Then load `git_recency_map.bin` in your fuzzer state and use the git-aware scheduler (next section). For a complete working example, see `scripts/git_aware_reth_bench.sh`.
@@ -172,21 +160,11 @@ Enable index tracking on your map observer (`.track_indices()`), load the mappin
 Minimal sketch (exact types vary by fuzzer):
 
 ```rust
-use libafl::{
-    HasMetadata,
-    observers::{CanTrack, StdMapObserver},
-    schedulers::{GitAwareStdWeightedScheduler, GitRecencyConfigMetadata, GitRecencyMapMetadata},
-};
-
 let edges_observer = StdMapObserver::owned("edges", vec![0u8; 65536]).track_indices();
-
 state.add_metadata(GitRecencyMapMetadata::load_from_file("git_recency_map.bin")?);
 state.add_metadata(GitRecencyConfigMetadata::new(2.0)); // optional, default is 2.0
-
 let scheduler = GitAwareStdWeightedScheduler::new(&mut state, &edges_observer);
 ```
-
-For the full plan, see `docs/plans/git-aware-recent-coverage-scheduler.md`.
 
 ## Benchmark
 
@@ -195,7 +173,6 @@ You can run the `reth` benchmark with:
 ```sh
 bash scripts/git_aware_reth_bench.sh --trials 3 --budget 120 --warmup 30
 ```
-
 
 This benchmark creates a temporary `reth` git checkout under `/tmp`, adds a small LibAFL in-process fuzzer crate and a freshly committed crashing line marked `RECENT_BUG` so `git blame` treats it as recently changed code, builds the target with SanitizerCoverage (`trace-pc-guard`) plus the git-recency LLVM pass to generate a `pcguard_index -> git blame timestamp` mapping, then runs paired baseline vs git-aware trials and reports the median time-to-first-crash.
 
