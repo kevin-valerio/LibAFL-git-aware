@@ -1,10 +1,55 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+DEFAULT_TRIALS=10
+DEFAULT_BUDGET_SECS=60
+DEFAULT_WARMUP_SECS=30
+DEFAULT_RUST_TOOLCHAIN="1.90.0"
+
+# Benchmark overview (high level)
+#
+# Goal: compare baseline scheduling vs git-aware scheduling on a target where the crash is in
+# "recently changed" code (as determined by `git blame`).
+#
+# Flow:
+#  1) Create a temporary `reth` git checkout under $bench_root/reth (shallow clone).
+#  2) Add a small in-process fuzzer crate: crates/libafl-gitaware-bench (writes queue/ + crashes/).
+#  3) Create a synthetic "old" baseline commit (dated 2000-01-01) where RECENT_BUG does NOT crash.
+#  4) Build the baseline binary with:
+#       - SanitizerCoverage trace-pc-guard edges
+#       - LibAFL git-recency LLVM plugin (records debug locations for pcguard indices)
+#  5) Warmup: run the baseline binary for --warmup seconds (mapping disabled) to generate an initial
+#     corpus in $bench_root/warmup/out/queue. This reduces variance by avoiding "startup exploration"
+#     dominating the results, and ensures both variants start from identical inputs.
+#  6) Introduce a new commit that flips a single line to crash (marked "RECENT_BUG") and rebuild.
+#     Because it's a new commit, `git blame` will mark that line as "recent".
+#  7) Generate the `pcguard_index -> git blame timestamp` mapping file for the rebuilt binary.
+#  8) Run paired trials (baseline vs git-aware), each starting from the warmup corpus:
+#       - baseline: do NOT set LIBAFL_GIT_RECENCY_MAPPING_PATH (no recency boost)
+#       - git-aware: set LIBAFL_GIT_RECENCY_MAPPING_PATH (recency boost enabled)
+#     Time-to-first-crash is measured by watching for a file to appear in out/crashes/.
+#
+# Output layout:
+#   $bench_root/in/                  initial seeds
+#   $bench_root/tools/               built libafl tools + git-recency LLVM plugin
+#   $bench_root/warmup/out/queue/    warmup-generated initial corpus
+#   $bench_root/runs/{baseline,git-aware}/trial_*/out/{queue,crashes}
+#
 usage() {
   cat <<'EOF'
 Usage:
   scripts/git_aware_reth_bench.sh [--trials N] [--budget SECS] [--warmup SECS] [--bench-root DIR]
+EOF
+  cat <<EOF
+
+Defaults:
+  --trials     ${DEFAULT_TRIALS}
+  --budget     ${DEFAULT_BUDGET_SECS}
+  --warmup     ${DEFAULT_WARMUP_SECS}
+  --bench-root \$BENCH_ROOT or a mktemp dir under /tmp
+  RUST_TOOLCHAIN=\$RUST_TOOLCHAIN or ${DEFAULT_RUST_TOOLCHAIN}
+EOF
+  cat <<'EOF'
 
 What it does:
   - Creates a local benchmark repo in /tmp based on a shallow checkout of:
@@ -15,6 +60,21 @@ What it does:
     git-recency LLVM pass.
   - Generates a `pcguard_index -> git blame timestamp` mapping file.
   - Runs N paired trials (baseline vs git-aware) and prints median time-to-first-crash.
+
+How warmup works:
+  - Warmup runs the *baseline snapshot* (no crash) for --warmup seconds.
+  - Warmup always disables the mapping (baseline behavior) and uses LIBAFL_RAND_SEED=0.
+  - The resulting queue corpus directory:
+      $bench_root/warmup/out/queue
+    is then used as the input corpus for all trials.
+
+How trials work:
+  - After warmup, the script commits a single-line crash marked "RECENT_BUG" and rebuilds.
+  - For each trial i=1..N, it runs the same fuzzer binary twice:
+      1) baseline  (LIBAFL_RAND_SEED=i, mapping disabled)
+      2) git-aware (LIBAFL_RAND_SEED=i, mapping enabled)
+  - time-to-first-crash is wall-clock time until a file appears under out/crashes/.
+    If no crash is found within --budget seconds, that trial counts as "budget" seconds.
 
 Notes:
   - This script creates an intentionally crashing repo. Never push it anywhere.
@@ -33,7 +93,7 @@ mktemp_dir() {
 }
 
 rust_toolchain() {
-  echo "${RUST_TOOLCHAIN:-1.90.0}"
+  echo "${RUST_TOOLCHAIN:-${DEFAULT_RUST_TOOLCHAIN}}"
 }
 
 ensure_host_deps() {
@@ -594,6 +654,11 @@ run_warmup() {
   local seed_dir="$3"
   local warmup_secs="$4"
 
+  # Warmup is a short run whose only purpose is to generate a stable-ish starting corpus
+  # (the output queue directory). We intentionally:
+  #  - run on the baseline snapshot (no RECENT_BUG crash yet)
+  #  - disable mapping to avoid git-aware bias during warmup
+  #  - fix the rand seed to reduce variance across repeated benchmark runs
   python3 - <<PY
 import os
 import signal
@@ -682,6 +747,10 @@ run_trials() {
   local trials="$5"
   local input_dir="$6"
 
+  # Trial runner:
+  #  - Runs baseline vs git-aware sequentially (paired) with the same LIBAFL_RAND_SEED.
+  #  - Starts each run from the same input corpus directory (the warmup queue).
+  #  - Detects a crash by watching for any file to appear in out/crashes/.
   python3 - <<PY
 import os
 import signal
@@ -808,9 +877,9 @@ PY
 }
 
 main() {
-  local trials=10
-  local budget_secs=60
-  local warmup_secs=30
+  local trials="${DEFAULT_TRIALS}"
+  local budget_secs="${DEFAULT_BUDGET_SECS}"
+  local warmup_secs="${DEFAULT_WARMUP_SECS}"
   local bench_root=""
 
   while [[ $# -gt 0 ]]; do
@@ -864,7 +933,9 @@ main() {
   init_bench_repo "${bench_root}"
   write_seeds "${bench_root}"
 
-  # Build once on the baseline commit and generate a stable-ish corpus to start from.
+  # Baseline snapshot: build once and generate a stable-ish corpus to start from.
+  # This warmup run is intentionally done before we introduce the crashing line, so it doesn't
+  # terminate early and skew the starting corpus.
   local seed_dir="${bench_root}/in"
   local baseline_bin
   baseline_bin="$(build_bench_fuzzer "${bench_root}" "${tools_dir}")"

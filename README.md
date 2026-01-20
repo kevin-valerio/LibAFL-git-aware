@@ -140,6 +140,8 @@ You can run the `reth` benchmark with:
 bash scripts/git_aware_reth_bench.sh --trials 3 --budget 120 --warmup 30
 ```
 
+Defaults are `--trials 10 --budget 60 --warmup 30` (see `--help`).
+
 This benchmark creates a temporary `reth` git checkout under `/tmp`, adds a small LibAFL in-process fuzzer crate and a freshly committed crashing line marked `RECENT_BUG` so `git blame` treats it as recently changed code, builds the target with SanitizerCoverage (`trace-pc-guard`) plus the git-recency LLVM pass to generate a `pcguard_index -> git blame timestamp` mapping, then runs paired baseline vs git-aware trials and reports the median time-to-first-crash.
 
 The baseline found 0/3 crashes (median 120.000s), while the git-aware run found 2/3 (median 28.056s).
