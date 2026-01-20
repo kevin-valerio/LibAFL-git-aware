@@ -225,6 +225,10 @@ pub(crate) unsafe fn sanitizer_cov_pcguard_impl(guard: *mut u32) {
     unsafe {
         #[allow(unused_variables, unused_mut)] // cfg dependent
         let mut pos = *guard as usize;
+        if pos == 0 {
+            return;
+        }
+        pos = pos.wrapping_sub(1);
 
         #[cfg(any(feature = "sancov_ngram4", feature = "sancov_ngram8"))]
         {
@@ -330,7 +334,7 @@ pub unsafe extern "C" fn __sanitizer_cov_trace_pc_guard_init(
     #[cfg(feature = "coverage")]
     while start < stop {
         unsafe {
-            *start = MAX_EDGES_FOUND as u32;
+            *start = (MAX_EDGES_FOUND as u32).wrapping_add(1);
             start = start.offset(1);
         }
 

@@ -189,6 +189,7 @@ mod tests {
     fn test_dump_cov() {
         unsafe extern "C" {
             fn __sanitizer_cov_trace_pc_guard(guard: *mut u32);
+            fn __sanitizer_cov_trace_pc_guard_init(start: *mut u32, stop: *mut u32);
         }
 
         pcguard_enable_coverage_collection();
@@ -199,7 +200,9 @@ mod tests {
         // The pointer is valid and points to a valid memory location.
         let mut guard = 0;
         unsafe {
-            __sanitizer_cov_trace_pc_guard(&raw mut guard);
+            let guard_ptr = &raw mut guard;
+            __sanitizer_cov_trace_pc_guard_init(guard_ptr, guard_ptr.add(1));
+            __sanitizer_cov_trace_pc_guard(guard_ptr);
         }
 
         let map = dump_covered_lines(true);
