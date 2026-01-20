@@ -215,19 +215,18 @@ Time to find the introduced bug with `bash scripts/git_aware_reth_bench.sh --tri
 
 Time to find the introduced bug with `bash scripts/git_aware_reth_bench.sh --trials 10  --budget 6000 --input-corpus /tmp/libafl_gitaware_reth_bench.bynvh6UT/warmup/out/queue/`
 
-| trial | baseline_s | git-aware_s | winner   |
-|-------|------------|------------|----------|
-| 1     | 107.443    | 52.267     | git-aware |
-| 2     | 86.076     | 60.382     | git-aware |
-| 3     | 31.772     | 124.470    | baseline |
-| 4     | 44.089     | 13.072     | git-aware |
-| 5     | 211.480    | 27.938     | git-aware |
-| 6     | 211.480    | 27.938     | git-aware |
-| 7     | 211.480    | 27.938     | git-aware |
-| 8     | 211.480    | 27.938     | git-aware |
-| 9     | 211.480    | 27.938     | git-aware |
-| 10     | 211.480    | 27.938     | git-aware |
-
+| trial | baseline_s | git-aware_s | winner    |
+|------:|-----------:|------------:|-----------|
+|     1 |     79.683 |      94.540 | baseline  |
+|     2 |    233.198 |       8.517 | git-aware |
+|     3 |     84.579 |      51.279 | git-aware |
+|     4 |      5.628 |       2.262 | git-aware |
+|     5 |     84.615 |      89.174 | baseline  |
+|     6 |    534.511 |      10.955 | git-aware |
+|     7 |    226.654 |       2.116 | git-aware |
+|     8 |    865.867 |      16.582 | git-aware |
+|     9 |     78.062 |     159.150 | baseline  |
+|    10 |     43.719 |      34.985 | git-aware |
 
 ## License
 
