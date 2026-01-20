@@ -145,25 +145,15 @@ This benchmark creates a temporary `reth` git checkout under `/tmp`, adds a smal
 
 ### Benchmark 1
 
-Summary (timeouts are capped to budget seconds):
-  variant    found  success  median_s  mean_s   p25_s    p75_s   std_s   min_s    max_s
-  ---------  -----  -------  --------  ------  ------  -------  ------  ------  -------
-  baseline     5/5   100.0%    86.076  96.172  44.089  107.443  63.851  31.772  211.480
-  git-aware    5/5   100.0%    52.267  55.626  27.938   60.382  38.343  13.072  124.470
+Time to find the introduced bug
 
-Paired comparison (by seed, lower is better):
-  Wins/ties/losses (git-aware vs baseline): 4/0/1
-  Median delta (baseline - git-aware): 33.809s
-  Median speedup factor: 1.647x
-
-Per-trial breakdown (capped at budget on timeout):
-  trial  baseline_s  git-aware_s  winner
-  -----  ----------  -----------  ---------
-      1     107.443       52.267  git-aware
-      2      86.076       60.382  git-aware
-      3      31.772      124.470  baseline
-      4      44.089       13.072  git-aware
-      5     211.480       27.938  git-aware
+| trial | baseline_s | git-aware_s | winner   |
+|-------|------------|------------|----------|
+| 1     | 107.443    | 52.267     | git-aware |
+| 2     | 86.076     | 60.382     | git-aware |
+| 3     | 31.772     | 124.470    | baseline |
+| 4     | 44.089     | 13.072     | git-aware |
+| 5     | 211.480    | 27.938     | git-aware |
 
 ## License
 
